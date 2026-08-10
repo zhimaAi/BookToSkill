@@ -1,13 +1,13 @@
 ---
-name: doc-to-skill
+name: Book2Skill
 description: "Convert one or more TXT, Markdown, DOCX, or PDF documents into a reusable skill zip backed by normalized Markdown, extracted images, and a grounded JSONL knowledge index. Invoke this skill before inspecting task files, then execute its workflow directly without listing directories."
 ---
 
-# Doc To Skill
+# Book2Skill
 
 Convert every supplied document into one portable, indexed skill. Keep all generated files under the writable task
-directory supplied by the system prompt. Do not install packages, call OCR or vision models, or depend on application
-framework code.
+directory supplied by the system prompt. Do not install packages, call vision models, or depend on application framework
+code. Use online OCR only when the system prompt explicitly enables it.
 
 Let `<skill-dir>` be the skill directory supplied by the skill loader. Use it exactly as supplied. Run bundled scripts
 in place with `python3 <skill-dir>/scripts/...`; never copy scripts, guess an absolute path, prepend another directory,
@@ -16,6 +16,13 @@ or add `cd`.
 Let `<task-dir>` be the writable task directory supplied by the system prompt. Inputs are in `<task-dir>/input`. Store
 all workflow artifacts and the final zip below `<task-dir>`. Every command appends diagnostics to
 `<task-dir>/doc.log`.
+
+## Choose create or update mode
+
+Use create mode unless the system prompt explicitly identifies an update and supplies both the existing skill zip and
+the required unchanged skill name. Update mode receives only newly uploaded source documents. The preparation script
+safely reuses normalized Markdown and assets from the validated existing package, converts only the new documents,
+rebuilds the complete index and package, and keeps that name exactly unchanged. Do not infer or alter the required name.
 
 Proceed directly with the commands below. Do not inventory the skill or task directory, pre-create output directories,
 or read bundled scripts. The scripts create their own directories and report the bounded data needed for each step.
@@ -34,8 +41,21 @@ python3 <skill-dir>/scripts/prepare_workflow.py \
   --log <task-dir>/doc.log
 ```
 
+When the system prompt enables online OCR, append `--online-ocr`; the converter handles image localization and fallback
+internally. Omit `--online-ocr` when it is not enabled.
+
+In update mode, also append the existing package to the same preparation command:
+
+```bash
+  --existing-skill <task-dir>/existing-skill.zip
+```
+
+Online OCR applies only to the newly uploaded PDFs. Existing normalized Markdown and assets come from the existing
+package, so previously processed PDFs are not submitted to the API again.
+
 The converter accepts `.txt`, `.md`, `.docx`, and `.pdf`. It preserves DOCX/PDF images, extracts usable PDF text, and
-renders PDF pages without usable text as one image per page. It never performs OCR or image interpretation.
+renders PDF pages without usable text as one image per page when local conversion is used. It never performs image
+interpretation.
 
 After `status: prepared`, immediately run the batch iterator in step 2. Never open, list, or read `chunks/`,
 `chunks.jsonl`, `index-state.json`, or individual chunk files through file tools. They are private workflow artifacts;
@@ -123,6 +143,10 @@ python3 <skill-dir>/scripts/build_skill.py \
   --log <task-dir>/doc.log
 ```
 
+In update mode, also pass `--expected-name <existing-skill-name>` and use that exact value in both metadata `name` and
+the zip filename. If validation reports a mismatch, correct only metadata `name`; do not rerun document preparation or
+indexing.
+
 If build validation rejects `<task-dir>/skill-metadata.json`, correct only that file and rerun the build stage. Do not
 repeat document preparation, batch indexing, or index merging when their validated outputs are already present.
 
@@ -142,7 +166,6 @@ The generated archive contains:
 ```
 
 The generated skill reads its bounded JSONL index and may inspect packaged Markdown or images through file operations.
-It has no dependency on DocToSkill's host application.
 
 ## Completion checks
 
@@ -153,7 +176,7 @@ Before success, confirm from command results:
    content restored from its own chunk, and image-only chunks counted automatically.
 3. Merge produces a non-empty `<task-dir>/doc-index.jsonl`.
 4. Build reports `status: complete`, `action: return_zip_path`, and the final `zip_path`; its deterministic validation
-   guarantees the zip contains `SKILL.md`, `agents/openai.yaml`, the index, source Markdown, retrieval script, and every
-   referenced extracted asset.
+   guarantees the zip contains `SKILL.md`, `agents/openai.yaml`, the index, source Markdown, the retrieval script, and
+   every referenced extracted asset.
 5. Return only the reported `zip_path` immediately. Do not call `ls` or reopen the zip, index, source chunks, or
    `doc.log` after a successful build. Inspect them only to diagnose a reported script error.

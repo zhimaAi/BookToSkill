@@ -6,13 +6,20 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import html
 import json
+import mimetypes
 import os
 import re
 import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from pathlib import Path
 
 
@@ -25,6 +32,21 @@ if hasattr(sys.stderr, "reconfigure"):
 SUPPORTED = {".txt", ".md", ".docx", ".pdf"}
 PDF_MIN_TEXT_CHARS = 20
 PDF_RENDER_DPI = 180
+API_URL_ENV = "CHATWIKI_APIURL"
+API_KEY_ENV = "CHATWIKI_APIKEY"
+DEFAULT_API_URL = "https://cloud.chatwiki.com"
+DOC_PARSER_PATH = "/open/aliyunDocParser"
+MARKDOWN_IMAGE_RE = re.compile(
+    r"!\[(?P<alt>[^\]\n]*)\]\((?P<wrapped><)?"
+    r"(?P<url>https?://[^\s)>\n]+)(?(wrapped)>)"
+    r"(?P<title>\s+(?:\"[^\"\n]*\"|'[^'\n]*'))?\)",
+    flags=re.IGNORECASE,
+)
+HTML_IMAGE_RE = re.compile(
+    r"(?P<prefix><img\b[^>]*?\bsrc\s*=\s*(?P<quote>[\"']))"
+    r"(?P<url>https?://[^\"'<>\s]+)(?P<suffix>(?P=quote))",
+    flags=re.IGNORECASE,
+)
 
 
 class WorkflowLogger:
@@ -51,6 +73,146 @@ LOGGER = WorkflowLogger(None)
 def safe_name(value: str) -> str:
     value = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "-", value).strip(" .-")
     return value or "document"
+
+
+def online_ocr_multipart(path: Path, boundary: str) -> bytes:
+    filename = safe_name(path.name).replace('"', "-")
+    header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        "Content-Type: application/pdf\r\n\r\n"
+    ).encode("utf-8")
+    return header + path.read_bytes() + f"\r\n--{boundary}--\r\n".encode("ascii")
+
+
+def request_online_ocr(path: Path) -> str:
+    api_url = os.environ.get(API_URL_ENV, DEFAULT_API_URL).strip() or DEFAULT_API_URL
+    endpoint = api_url.rstrip("/") + DOC_PARSER_PATH
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(f"{API_URL_ENV} must be an HTTP or HTTPS URL")
+    api_key = os.environ.get(API_KEY_ENV, "").strip()
+    if not api_key:
+        raise RuntimeError(f"{API_KEY_ENV} is not configured")
+    boundary = "----chatwiki-doc-parser-" + uuid.uuid4().hex
+    request = urllib.request.Request(
+        endpoint,
+        data=online_ocr_multipart(path, boundary),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+            "User-Agent": "ChatWiki-DocToSkill/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            payload = response.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"online OCR request failed: {exc}") from exc
+    try:
+        result = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("online OCR response is not valid UTF-8 JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("online OCR response root must be an object")
+    if result.get("res") != 0:
+        raise RuntimeError(str(result.get("msg") or "online OCR returned a failure result").strip())
+    markdown = result.get("data")
+    if not isinstance(markdown, str) or not markdown.strip():
+        raise RuntimeError("online OCR returned empty markdownContent")
+    return markdown.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+
+
+def online_ocr_image_urls(markdown: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for pattern in (MARKDOWN_IMAGE_RE, HTML_IMAGE_RE):
+        for match in pattern.finditer(markdown):
+            url = html.unescape(match.group("url")).strip()
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
+def online_ocr_image_extension(url: str, content_type: str) -> str:
+    mime = content_type.partition(";")[0].strip().lower()
+    extension = mimetypes.guess_extension(mime) if mime.startswith("image/") else None
+    if not extension:
+        extension = Path(urllib.parse.urlsplit(url).path).suffix
+    extension = re.sub(r"[^a-zA-Z0-9]", "", (extension or "").lstrip(".").lower())
+    return "jpg" if extension == "jpeg" else extension or "bin"
+
+
+def normalize_markdown_image_description(value: str) -> str:
+    value = " ".join(html.unescape(value).split())
+    return value.replace("[", "(").replace("]", ")")
+
+
+def merge_markdown_image_description(alt: str, raw_title: str | None) -> str:
+    alt = normalize_markdown_image_description(alt)
+    title = str(raw_title or "").strip()
+    if len(title) >= 2 and title[0] == title[-1] and title[0] in {"\"", "'"}:
+        title = title[1:-1]
+    title = normalize_markdown_image_description(title)
+    if not title or alt.casefold() == title.casefold():
+        return alt
+    if not alt:
+        return title
+    return f"{alt} - {title}"
+
+
+def download_online_ocr_image(url: str) -> tuple[bytes, str]:
+    request = urllib.request.Request(url, headers={"User-Agent": "ChatWiki-DocToSkill/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = response.read()
+            content_type = str(response.headers.get("Content-Type") or "")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"cannot download OCR image {url}: {exc}") from exc
+    if not payload:
+        raise RuntimeError(f"OCR image is empty: {url}")
+    return payload, online_ocr_image_extension(url, content_type)
+
+
+def localize_online_ocr_images(markdown: str, markdown_path: Path, asset_dir: Path) -> str:
+    urls = online_ocr_image_urls(markdown)
+    if not urls:
+        return markdown
+    asset_dir = asset_dir.resolve()
+    markdown_dir = markdown_path.parent.resolve()
+    asset_dir.parent.mkdir(parents=True, exist_ok=True)
+    replacements: dict[str, str] = {}
+    staged: list[tuple[Path, Path]] = []
+    with tempfile.TemporaryDirectory(prefix="ocr-images-", dir=asset_dir.parent) as temporary:
+        temporary_dir = Path(temporary)
+        for index, url in enumerate(urls, start=1):
+            payload, extension = download_online_ocr_image(url)
+            digest = hashlib.sha256(payload).hexdigest()[:12]
+            name = f"ocr-image-{index:04d}-{digest}.{extension}"
+            temporary_path = temporary_dir / name
+            temporary_path.write_bytes(payload)
+            target = asset_dir / name
+            replacements[url] = Path(os.path.relpath(target, markdown_dir)).as_posix()
+            staged.append((temporary_path, target))
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        for source, target in staged:
+            shutil.copy2(source, target)
+
+    def replace(match: re.Match[str]) -> str:
+        localized = replacements[html.unescape(match.group("url")).strip()]
+        if match.re is MARKDOWN_IMAGE_RE:
+            description = merge_markdown_image_description(match.group("alt"), match.group("title"))
+            return f"![{description}]({localized})"
+        return f"{match.group('prefix')}{localized}{match.group('suffix')}"
+
+    return HTML_IMAGE_RE.sub(replace, MARKDOWN_IMAGE_RE.sub(replace, markdown))
+
+
+def convert_pdf_online(path: Path, markdown_path: Path, asset_dir: Path) -> str:
+    return localize_online_ocr_images(request_online_ocr(path), markdown_path, asset_dir)
 
 
 def read_text(path: Path) -> str:
@@ -326,7 +488,7 @@ def convert_pdf(path: Path, markdown_path: Path, asset_dir: Path) -> str:
     return "\n\n".join(output).strip() + "\n"
 
 
-def convert_one(path: Path, output_dir: Path, assets_root: Path) -> dict:
+def convert_one(path: Path, output_dir: Path, assets_root: Path, online_ocr: bool = False) -> dict:
     document_id = path.name
     markdown_path = output_dir / path.with_suffix(".md").name
     asset_dir = assets_root / path.stem
@@ -336,7 +498,29 @@ def convert_one(path: Path, output_dir: Path, assets_root: Path) -> dict:
     elif path.suffix.lower() == ".docx":
         content = convert_docx(path, markdown_path, asset_dir)
     elif path.suffix.lower() == ".pdf":
-        content = convert_pdf(path, markdown_path, asset_dir)
+        if online_ocr:
+            try:
+                content = convert_pdf_online(path, markdown_path, asset_dir)
+                LOGGER.emit("convert", "online_ocr.succeed", source_name=path.name)
+            except Exception as exc:
+                LOGGER.emit(
+                    "convert",
+                    "online_ocr.fallback",
+                    source_name=path.name,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                print(
+                    f"WARN: online OCR failed for {path.name}; using local PDF conversion: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if asset_dir.is_dir():
+                    shutil.rmtree(asset_dir)
+                asset_dir.mkdir(parents=True, exist_ok=True)
+                content = convert_pdf(path, markdown_path, asset_dir)
+        else:
+            content = convert_pdf(path, markdown_path, asset_dir)
     else:
         raise ValueError(f"unsupported file type: {path.name}")
     markdown_path.write_text(content, encoding="utf-8", newline="\n")
@@ -360,6 +544,7 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--assets", required=True, type=Path)
     parser.add_argument("--log", required=True, type=Path)
+    parser.add_argument("--online-ocr", action="store_true")
     args = parser.parse_args()
     LOGGER = WorkflowLogger(args.log)
     LOGGER.emit("convert", "start", input=args.input.as_posix(), output=args.output.as_posix(), assets=args.assets.as_posix())
@@ -389,7 +574,7 @@ def main() -> int:
     errors: list[str] = []
     for path in files:
         try:
-            record = convert_one(path, args.output, args.assets)
+            record = convert_one(path, args.output, args.assets, online_ocr=args.online_ocr)
             records.append(record)
             LOGGER.emit("convert", "document.succeed", **record)
             print(json.dumps({"stage": "convert", "status": "succeed", **record}, ensure_ascii=False), flush=True)

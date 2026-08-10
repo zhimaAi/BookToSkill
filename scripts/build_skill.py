@@ -153,7 +153,7 @@ def load_index(path: Path, markdown_dir: Path, assets_dir: Path) -> tuple[list[d
     return rows, document_ids
 
 
-def load_metadata(path: Path, document_ids: set[str]) -> dict[str, Any]:
+def load_metadata(path: Path, document_ids: set[str], expected_name: str | None = None) -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
@@ -167,6 +167,8 @@ def load_metadata(path: Path, document_ids: set[str]) -> dict[str, Any]:
     name = require_text(raw["name"], "metadata.name", max_length=50)
     if not NAME_RE.fullmatch(name):
         raise ValueError("metadata.name must use lowercase letters, digits, and single hyphens only")
+    if expected_name and name != expected_name:
+        raise ValueError(f"metadata.name must remain unchanged during update: expected {expected_name}, got {name}")
     title = require_text(raw["title"], "metadata.title", max_length=80)
     description = require_text(raw["description"], "metadata.description", max_length=500)
     source_summary = require_text(raw["source_summary"], "metadata.source_summary", max_length=1200)
@@ -340,7 +342,10 @@ def build(args: argparse.Namespace) -> tuple[Path, int]:
         raise ValueError("--zip-out must end with .zip")
 
     rows, document_ids = load_index(index_path, markdown_dir, assets_dir)
-    metadata = load_metadata(metadata_path, document_ids)
+    expected_name = str(args.expected_name or "").strip() or None
+    if expected_name and not NAME_RE.fullmatch(expected_name):
+        raise ValueError("--expected-name must be a valid skill name")
+    metadata = load_metadata(metadata_path, document_ids, expected_name)
     markdown_files = sorted(markdown_dir.glob("*.md"))
     if not markdown_files:
         raise ValueError("source Markdown directory is empty")
@@ -378,6 +383,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assets", required=True)
     parser.add_argument("--zip-out", required=True)
     parser.add_argument("--log", required=True)
+    parser.add_argument("--expected-name")
     return parser.parse_args()
 
 
